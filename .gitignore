@@ -3,3 +3,12 @@
 *obj/
 *.ico
 *.user
+
+# Build artifacts
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.o
