@@ -10,6 +10,16 @@
 
 #pragma comment(lib, "psapi.lib")
 
+// Maximum relative jump range for x64 JMP rel32 instruction
+// The rel32 offset is a signed 32-bit value, so the range is -2GB to +2GB
+// We use 0x70000000 (~1.87GB) to leave a safety margin
+constexpr intptr_t MAX_RELATIVE_JUMP_RANGE = 0x70000000;
+
+// Initialization retry settings
+constexpr int INIT_DELAY_MS = 1000;      // Initial delay before first attempt
+constexpr int INIT_MAX_RETRIES = 30;     // Maximum number of retry attempts
+constexpr int INIT_RETRY_DELAY_MS = 500; // Delay between retry attempts
+
 // Pattern definitions from original GameData.cs
 // Camera adjustment patterns for disabling auto-rotate on movement
 
@@ -112,8 +122,8 @@ void* AllocateNearAddress(void* targetAddr, size_t size) {
     GetSystemInfo(&si);
     
     uintptr_t target = (uintptr_t)targetAddr;
-    uintptr_t minAddr = target - 0x70000000;
-    uintptr_t maxAddr = target + 0x70000000;
+    uintptr_t minAddr = target - MAX_RELATIVE_JUMP_RANGE;
+    uintptr_t maxAddr = target + MAX_RELATIVE_JUMP_RANGE;
     
     if (minAddr < (uintptr_t)si.lpMinimumApplicationAddress) {
         minAddr = (uintptr_t)si.lpMinimumApplicationAddress;
@@ -131,7 +141,8 @@ void* AllocateNearAddress(void* targetAddr, size_t size) {
     while (addr < maxAddr) {
         if (VirtualQuery((void*)addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
             if (mbi.State == MEM_FREE && mbi.RegionSize >= size) {
-                void* allocated = VirtualAlloc((void*)mbi.BaseAddress, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                // Allocate as read-write first, will change to execute after writing
+                void* allocated = VirtualAlloc((void*)mbi.BaseAddress, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
                 if (allocated) {
                     return allocated;
                 }
@@ -165,11 +176,12 @@ bool CreateCodeCave(uintptr_t instructionAddr, int overwriteLength, const uint8_
     caveCode[shellcodeSize] = 0xE9; // JMP rel32
     *(int32_t*)&caveCode[shellcodeSize + 1] = (int32_t)jumpBackOffset;
     
-    // Write cave code
-    DWORD oldProtect;
-    VirtualProtect(caveAddr, caveSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+    // Write cave code (memory is already PAGE_READWRITE from allocation)
     memcpy(caveAddr, caveCode.data(), caveCode.size());
-    VirtualProtect(caveAddr, caveSize, oldProtect, &oldProtect);
+    
+    // Change protection to execute-read (no write) for security
+    DWORD oldProtect;
+    VirtualProtect(caveAddr, caveSize, PAGE_EXECUTE_READ, &oldProtect);
     
     // Calculate relative jump offset from instruction to cave
     intptr_t jumpToCaveOffset = (intptr_t)caveAddr - (intptr_t)instructionAddr - 5;
@@ -192,18 +204,25 @@ bool CreateCodeCave(uintptr_t instructionAddr, int overwriteLength, const uint8_
 
 // Main injection function
 void ApplyCameraFix() {
-    // Wait a bit for the game to fully initialize
-    Sleep(5000);
+    // Initial delay to let the game start loading
+    Sleep(INIT_DELAY_MS);
     
-    // Get module info
-    HMODULE hModule = GetModuleHandle(nullptr);
-    if (!hModule) {
-        return;
+    // Get module info with retry logic
+    HMODULE hModule = nullptr;
+    MODULEINFO moduleInfo = {0};
+    
+    for (int retry = 0; retry < INIT_MAX_RETRIES; retry++) {
+        hModule = GetModuleHandle(nullptr);
+        if (hModule && GetModuleInformation(GetCurrentProcess(), hModule, &moduleInfo, sizeof(moduleInfo))) {
+            // Verify the module is fully loaded by checking for a reasonable size
+            if (moduleInfo.SizeOfImage > 0x1000000) { // At least 16MB (Sekiro is much larger)
+                break;
+            }
+        }
+        Sleep(INIT_RETRY_DELAY_MS);
     }
     
-    // Get module size
-    MODULEINFO moduleInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hModule, &moduleInfo, sizeof(moduleInfo))) {
+    if (!hModule || moduleInfo.SizeOfImage == 0) {
         return;
     }
     
@@ -253,10 +272,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         // Create a new thread to apply the camera fix
-        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            ApplyCameraFix();
-            return 0;
-        }, nullptr, 0, nullptr);
+        // The thread handle is closed immediately as we don't need to track it
+        // The thread will run to completion on its own
+        {
+            HANDLE hThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                ApplyCameraFix();
+                return 0;
+            }, nullptr, 0, nullptr);
+            if (hThread) {
+                CloseHandle(hThread);
+            }
+        }
         break;
     case DLL_PROCESS_DETACH:
         break;
